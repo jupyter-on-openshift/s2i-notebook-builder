@@ -1,0 +1,204 @@
+#!/bin/bash
+
+set -x
+
+set -eo pipefail
+
+# Define some common functions to use later.
+
+require() {
+    if [ ! -d /opt/app-root/packages/$1 ]; then
+        if [ ! -f .s2i/packages/$1/assemble ]; then
+            echo "ERROR: No runtime package $1 available." 
+            exit 1
+        fi
+
+        .s2i/packages/$1/assemble
+
+        . /opt/app-root/packages/$1/activate
+    fi
+}
+
+runtime() {
+    require $1
+
+    OLDPWD=$PWD
+
+    cd /opt/app-root/packages/$1/bin
+
+    ln -fs python$2 python
+    ln -fs python$2 python3
+
+    ln -fs pip$2 pip
+    ln -fs pip$2 pip3
+
+    cd $OLDPWD
+}
+
+# Move files from where S2I injects them to src directory for building.
+
+echo "Moving source files into place."
+
+(shopt -s dotglob; mv /tmp/src/* ./)
+
+# Fail if no packages have been injected into the container via the S2I
+# process.
+
+echo "Checking if runtime packages exist."
+
+if [ ! -d .s2i/packages ]; then
+    echo "ERROR: No runtime packages have been provided." 
+    exit 1
+fi
+
+# Determine default Python runtime to use.
+
+if [ x"$PYTHON_RUNTIME" = x"" ]; then
+    # If no runtime specified work out if should use Anaconda Python
+    # vs normal PSF Python by looking for presence of environment.yml.
+
+    if [ -f environment.yml ]; then
+        PYTHON_RUNTIME=conda-4.2
+    else
+        PYTHON_RUNTIME=python-3.5
+    fi
+fi
+
+case $PYTHON_RUNTIME in
+    python-3.*)
+        xy=`echo $PYTHON_RUNTIME | sed -e 's/python-\(.*\)$/\1/'`
+
+        runtime $PYTHON_RUNTIME $xy
+
+        python$xy -m ipykernel install --user --display-name "Python $xy"
+
+	if [ -d .s2i/wheelhouse/$PYTHON_RUNTIME ]; then
+	    PIP_FIND_LINKS=/opt/app-root/src/.s2i/wheelhouse/$PYTHON_RUNTIME
+	    export PIP_FIND_LINKS
+	fi
+
+        if [ -f requirements.txt ]; then
+            pip$xy install -r requirements.txt
+        fi
+
+        for kernel in $JUPYTER_KERNELS; do
+            case $kernel in
+                $PYTHON_RUNTIME)
+                    ;;
+
+                python-*)
+                    require $kernel
+
+		    xy=`echo $kernel | sed -e 's/python-\(.*\)$/\1/'`
+
+                    python$xy -m ipykernel install --user --name $kernel \
+                            --display-name "Python $xy"
+
+                    ;;
+
+                julia-*)
+                    require $kernel
+
+                    julia -e 'Pkg.init(); Pkg.add("IJulia"); using IJulia;'
+
+                    ;;
+
+                *)
+                    echo "ERROR: Whoops, not sure what to do for this kernel."
+                    exit 1
+                    ;;
+            esac
+        done
+
+        ;;
+
+    conda-4.2)
+        runtime $PYTHON_RUNTIME 3.5
+
+        python -m ipykernel install --user --display-name "Python 3.5"
+
+	if [ -d .s2i/wheelhouse/$PYTHON_RUNTIME ]; then
+	    PIP_FIND_LINKS=/opt/app-root/src/.s2i/wheelhouse/$PYTHON_RUNTIME
+	    export PIP_FIND_LINKS
+	fi
+
+        if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+        fi
+
+        for kernel in $JUPYTER_KERNELS; do
+            case $kernel in
+                julia-*)
+                    require $kernel
+
+                    julia -e 'Pkg.init(); Pkg.add("IJulia"); using IJulia;'
+
+                    ;;
+
+                *)
+                    echo "ERROR: Whoops, not sure what to do for this kernel."
+                    exit 1
+                    ;;
+            esac
+        done
+
+        ;;
+
+    conda-4.3)
+        runtime $PYTHON_RUNTIME 3.6
+
+        python -m ipykernel install --user --display-name "Python 3.6"
+
+	if [ -d .s2i/wheelhouse/$PYTHON_RUNTIME ]; then
+	    PIP_FIND_LINKS=/opt/app-root/src/.s2i/wheelhouse/$PYTHON_RUNTIME
+	    export PIP_FIND_LINKS
+	fi
+
+        if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+        fi
+
+        for kernel in $JUPYTER_KERNELS; do
+            case $kernel in
+                julia-*)
+                    require $kernel
+
+                    julia -e 'Pkg.init(); Pkg.add("IJulia"); using IJulia;'
+
+                    ;;
+
+                *)
+                    echo "ERROR: Whoops, not sure what to do for this kernel."
+                    exit 1
+                    ;;
+            esac
+        done
+
+        ;;
+
+    *)
+        echo "ERROR: Whoops, not sure what to do for this runtime."
+        exit 1
+        ;;
+esac
+
+jupyter notebook --generate-config
+
+cat >> $HOME/.jupyter/jupyter_notebook_config.py << EOF
+import os
+password = os.environ.get('JUPYTER_NOTEBOOK_PASSWORD')
+if password:
+    import notebook.auth
+    c.NotebookApp.password = notebook.auth.passwd(password)
+    del password
+    del os.environ['JUPYTER_NOTEBOOK_PASSWORD']
+EOF
+
+# Remove runtime packages which were not required as well as the wheelhouse.
+
+rm -rf .s2i/packages
+rm -rf .s2i/wheelhouse
+
+# Fixup permissions.
+
+fix-permissions /opt/app-root
